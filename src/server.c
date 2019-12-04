@@ -1,7 +1,14 @@
+/*
+ * Copyright (c) 2019 <initlevel5@gmail.com>
+ * All rights reserved
+ * 
+ * The socket server simple implementation
+ */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,13 +38,23 @@ enum conn_state {
 	ST_WRITE,
 };
 
+//@TODO implement real thread pool
 struct thread {
 	pthread_t id;
 	int fd;
 };
 
-static volatile int g_shutdown = 0;
+//@TODO implement list of connections
+/* strict conn {
+	int fd;
+	enum conn_state state;
+
+	...
+}*/
+
+static volatile sig_atomic_t g_shutdown = 0;
 static struct thread *th = NULL;
+static pthread_mutex_t th_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int make_socket_nonblocking(int fd) {
 	int flags;
@@ -55,12 +72,15 @@ static void *th_proc(void *arg) {
 	struct timeval tv = {0, 0};
 	time_t timeout;
 	unsigned char buf[BUF_SIZE];
+	memset(buf, 0, BUF_SIZE);
 
 	timeout = time(NULL) + CONN_TIMEOUT;
 
 	while (!g_shutdown) {
 		FD_ZERO(&rfds);
 		FD_ZERO(&wfds);
+
+		//@TODO check connections timeout
 
 		if (*fd != INVALID_SOCKET) {
 			if (state == ST_READ) {
@@ -79,7 +99,17 @@ static void *th_proc(void *arg) {
 				printf("select(): %s (%d)\n", strerror(err), err);
 				break;
 			}
-		} else if (res > 0) {
+		} else if (res == 0) {
+			if (state == ST_READ && timeout < time(NULL)) {
+				printf("connection timeout\n");
+				if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
+					printf("recv(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
+					break;
+				}
+				FD_CLOSE(*fd);
+				pthread_mutex_unlock(&th_mutex);
+			}
+		} else {
 			if (FD_ISSET(*fd, &rfds)) {
 				n = recv(*fd, buf + n_avail, BUF_SIZE - n_avail, 0);
 
@@ -92,7 +122,12 @@ static void *th_proc(void *arg) {
 						}
 					} else {
 						printf("recv(): connection closed by peer\n");
+						if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
+							printf("recv(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
+							break;
+						}
 						FD_CLOSE(*fd);
+						pthread_mutex_unlock(&th_mutex);
 					}
 					continue;
 				}
@@ -102,8 +137,13 @@ static void *th_proc(void *arg) {
 				if (req_len == 0 && n > 2) {
 					len = (int)((uint16_t)buf[1] >> 8) + (uint16_t)buf[0];
 					if (len < 3 || len > BUF_SIZE) {
-						printf("invalid request len (%d)\n", len);
+						printf("recv(): invalid request len (%d)\n", len);
+						if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
+							printf("recv(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
+							break;
+						}
 						FD_CLOSE(*fd);
+						pthread_mutex_unlock(&th_mutex);
 						continue;
 					}
 					req_len = len;
@@ -131,7 +171,12 @@ static void *th_proc(void *arg) {
 						}
 					} else {
 						printf("send(): connection closed by peer\n");
+						if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
+							printf("send(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
+							break;
+						}
 						FD_CLOSE(*fd);
+						pthread_mutex_unlock(&th_mutex);
 					}
 					continue;
 				}
@@ -146,13 +191,15 @@ static void *th_proc(void *arg) {
 		}
 	}
 
+	pthread_mutex_lock(&th_mutex);
 	FD_CLOSE(*fd);
+	pthread_mutex_unlock(&th_mutex);
 
 	return NULL;
 }
 
 static inline int conn_accept(int listener) {
-	int fd, err ,i;
+	int fd, err = 0, i;
 	struct sockaddr_in addr;
 	socklen_t addrlen = sizeof(struct sockaddr_in);
 
@@ -161,31 +208,61 @@ static inline int conn_accept(int listener) {
 			err = errno;
 			if (err == EINTR) continue;
 			if (err == EAGAIN || err == EWOULDBLOCK) return 0;
-			printf("accept(%d): %s (%d)\n", listener, strerror(err), err);
+			printf("conn_accept(): accept(%d): %s (%d)\n", listener, strerror(err), err);
 			return -1;
 		}
 		break;
 	}
 
-	//TODO implement real thread pool instead
+	if ((err = make_socket_nonblocking(fd)) != 0) {
+		printf("conn_accept(): make_socket_nonblocking(): %s (%d)\n", strerror(err), err);
+		goto _end;
+	}
+
+	//@TODO implement real thread pool instead
+	if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
+		printf("conn_accept(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
+		goto _end;
+	}
 	for (i = 0; i < MAX_NUM_THREADS; i++) {
 		if (th[i].fd == INVALID_SOCKET) {
 			th[i].fd = fd;
 			if (th[i].id == 0) {
 				if (pthread_create(&th[i].id, NULL, th_proc, (void *)&th[i].fd) != 0) {
 					err = errno;
-					printf("pthread_create(): %s (%d)\n", strerror(err), err);
+					printf("conn_accept(): pthread_create(): %s (%d)\n", strerror(err), err);
 					FD_CLOSE(th[i].fd);
+					pthread_mutex_unlock(&th_mutex);
 					return -1;
 				}
 			}
 			break;
 		}
 	}
+	pthread_mutex_unlock(&th_mutex);
 
-	if (i == MAX_NUM_THREADS) FD_CLOSE(fd);
+	if (i == MAX_NUM_THREADS) {
+		err = EAGAIN;
+		printf("conn_accept(): max number of threads reached\n");
+	}
 
-	return 0;
+_end:
+	if (err) FD_CLOSE(fd);
+	return err ? -1 : 0;
+}
+
+static void sig_term_handler(int sig) {
+	(void)sig;
+	g_shutdown = 1;
+}
+
+static void conf_sig_term_handler(void) {
+	struct sigaction sig_term_sa;
+
+	sig_term_sa.sa_handler = sig_term_handler;
+	sigemptyset(&sig_term_sa.sa_mask);
+	sig_term_sa.sa_flags = 0;
+	sigaction(SIGTERM, &sig_term_sa, NULL);
 }
 
 int main(int argc, char const *argv[]) {
@@ -196,7 +273,9 @@ int main(int argc, char const *argv[]) {
 	fd_set rfds;
 	struct timeval tv = {0, 0};
 
-	//
+	conf_sig_term_handler();
+
+	//bind
 	if ((listener = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
 		err = errno;
 		printf("socket(): %s (%d)\n", strerror(err), err);
@@ -243,7 +322,12 @@ int main(int argc, char const *argv[]) {
 		  (char *)inet_ntoa(addr_in.sin_addr),
 		  ntohs(addr_in.sin_port));
 
-	//TODO implement real thread pool instead
+	//@TODO implement real thread pool instead
+	if ((err = pthread_mutex_init(&th_mutex, NULL)) != 0) {
+		printf("pthread_mutex_init(): %s (%d)\n", strerror(err), err);
+		FD_CLOSE(listener);
+		_exit(EXIT_FAILURE);
+	}
 	th = (struct thread *)calloc(MAX_NUM_THREADS, sizeof(*th));
 	if (th == NULL) {
 		printf("can't allocate memory\n");
@@ -252,6 +336,7 @@ int main(int argc, char const *argv[]) {
 	}
 	for (i = 0; i < MAX_NUM_THREADS; i++) th[i].fd = INVALID_SOCKET;
 
+	//main loop
 	while (!g_shutdown) {
 		FD_ZERO(&rfds);
 		FD_SET(listener, &rfds);
@@ -274,6 +359,9 @@ int main(int argc, char const *argv[]) {
 
 	for (i = 0; i < MAX_NUM_THREADS; i++) pthread_join(th[i].id, NULL);
 	free(th);
+	pthread_mutex_destroy(&th_mutex);
+
+	printf("bye\n");
 
 	(void)argc;
 	(void)argv;

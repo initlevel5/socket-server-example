@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2019 <initlevel5@gmail.com>
+ * All rights reserved
+ * 
+ * The socket client simple implementation
+ */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <stdio.h>
@@ -41,6 +47,7 @@ int main(int argc, char const *argv[]) {
 	memset(buf, 0, BUF_SIZE);
 	const char *msg = "Hello World!";
 
+	//connect to the server
 	addr_in.sin_family = AF_INET;
 	addr_in.sin_addr.s_addr = inet_addr(ADDR);//INADDR_ANY;
 	addr_in.sin_port = htons((uint16_t)PORT);
@@ -64,6 +71,7 @@ int main(int argc, char const *argv[]) {
 
 	printf("connected successfully\n");
 
+	//build the message
 	n_to_write = 2 + strlen(msg);
 	buf[0] = (unsigned char)n_to_write;
 	buf[1] = (unsigned char)(n_to_write >> 8);
@@ -71,6 +79,7 @@ int main(int argc, char const *argv[]) {
 
 	timeout = time(NULL) + CONN_TIMEOUT;
 
+	//main loop
 	for (;;) {
 		FD_ZERO(&rfds);
 		FD_ZERO(&wfds);
@@ -90,7 +99,12 @@ int main(int argc, char const *argv[]) {
 				printf("select(): %s (%d)\n", strerror(err), err);
 				break;
 			}
-		} else if (res > 0) {
+		} else if (res == 0) {
+			if (state == ST_READ && timeout < time(NULL)) {
+				printf("connection timeout\n");
+				break;
+			}
+		} else {
 			if (FD_ISSET(fd, &rfds)) {
 				n = recv(fd, buf + n_avail, BUF_SIZE - n_avail, 0);
 
@@ -108,8 +122,8 @@ int main(int argc, char const *argv[]) {
 				n_avail += n;
 
 				if (req_len == 0 && n > 2) {
-					len = buf[0];
-					if (len > BUF_SIZE) {
+					len = (int)((uint16_t)buf[1] >> 8) + (uint16_t)buf[0];
+					if (len == 0 || len > BUF_SIZE) {
 						printf("invalid request len (%d)\n", len);
 						break;
 					}
