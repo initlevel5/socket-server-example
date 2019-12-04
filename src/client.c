@@ -1,6 +1,5 @@
 /*
  * Copyright (c) 2019 <initlevel5@gmail.com>
- * All rights reserved
  * 
  * The socket client simple implementation
  */
