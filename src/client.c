@@ -131,7 +131,7 @@ int main(int argc, char const *argv[]) {
 
 				if (n_avail == req_len) {
 					printf("%s\n", buf + 2);
-					if (++count > N) break;
+					if (++count > N) continue;
 
 					n_to_write = n_avail;	//echo
 					state = ST_WRITE;

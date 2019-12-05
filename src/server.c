@@ -33,8 +33,10 @@
 } while (0)
 
 enum conn_state {
-	ST_READ = 0,
-	ST_WRITE = 1,
+	ST_IDLE = 0,
+	ST_READ = 1,
+	ST_WAIT = 2,
+	ST_WRITE = 3,
 };
 
 struct conn {
@@ -72,6 +74,7 @@ static void *conn_proc(void *arg);
 static void conn_close(int *fd, struct conn *pc);
 static void conn_read(int *fd, struct conn *pc);
 static void conn_write(int *fd, struct conn *pc);
+static int conn_proto_handler(struct conn *pc);
 
 int main(int argc, char const *argv[]) {
 	int listener;
@@ -341,6 +344,10 @@ static void *conn_proc(void *arg) {
 		FD_ZERO(&wfds);
 
 		if (*fd != INVALID_SOCKET) {
+			if (pc->state == ST_IDLE) {
+				pc->state = ST_READ;
+				pc->timeout = time(NULL) + CONN_TIMEOUT;
+			}
 			if (pc->state == ST_READ) {
 				FD_SET(*fd, &rfds);
 			} else if (pc->state == ST_WRITE) {
@@ -358,7 +365,7 @@ static void *conn_proc(void *arg) {
 				break;
 			}
 		} else if (res == 0) {
-			if (*fd != INVALID_SOCKET && pc->timeout < time(NULL)) {
+			if (*fd != INVALID_SOCKET && pc->state == ST_READ && pc->timeout < time(NULL)) {
 				printf("conn_proc(): connection timeout\n");
 				conn_close(fd, pc);
 			}
@@ -386,7 +393,7 @@ static void conn_close(int *fd, struct conn *pc) {
 	memset(pc->buf, 0, BUF_SIZE);
 
 	pc->n_avail = pc->req_len = pc->n_to_write = pc->n_written = 0;
-	pc->state = ST_READ;
+	pc->state = ST_IDLE;
 
 	if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
 		printf("conn_close(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
@@ -427,10 +434,10 @@ static void conn_read(int *fd, struct conn *pc) {
 	}
 
 	if (pc->n_avail == pc->req_len) {
-		printf("%s\n", pc->buf + 2);
-
-		pc->n_to_write = pc->n_avail;	//echo
-		pc->state = ST_WRITE;
+		if (conn_proto_handler(pc) != 0) {
+			conn_close(fd, pc);
+			return;
+		}
 
 		pc->n_avail = pc->req_len = 0;
 		pc->timeout = time(NULL) + CONN_TIMEOUT;
@@ -461,4 +468,18 @@ static void conn_write(int *fd, struct conn *pc) {
 		pc->n_to_write = pc->n_written = 0;
 		pc->state = ST_READ;
 	}
+}
+
+/*
+ * Protocol specific handler.
+ *
+ * If successful, the function will return 0 or -1 if an error occurred.
+ */
+static int conn_proto_handler(struct conn *pc) {
+	printf("%s\n", pc->buf + 2);
+
+	pc->n_to_write = pc->n_avail;	//echo
+	pc->state = ST_WRITE;
+
+	return 0;
 }
