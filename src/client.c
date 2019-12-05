@@ -14,14 +14,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "proto.h"
+
 #define ADDR "127.0.0.1"
 #define PORT (8082)
 
-#define BUF_SIZE (1024)
+#define BUF_SIZE (1412)
 #define INVALID_SOCKET (-1)
 
 #define CONN_TIMEOUT (10)
-#define N (10)
 
 #define FD_CLOSE(x) do {\
 	while (close((x)) == -1 && errno == EINTR);\
@@ -34,7 +35,7 @@ enum conn_state {
 };
 
 int main(int argc, char const *argv[]) {
-	int count = 0, fd, err = 0, len, n, n_avail = 0, req_len = 0, n_to_write = 0, n_written = 0, res;
+	int fd, err = 0, len, n, n_avail = 0, req_len = 0, n_to_write = 0, n_written = 0, res;
 	enum conn_state state = ST_WRITE;
 	struct sockaddr_in addr_in;
 	socklen_t addrlen = sizeof(struct sockaddr_in);
@@ -44,7 +45,8 @@ int main(int argc, char const *argv[]) {
 	time_t timeout;
 	unsigned char buf[BUF_SIZE];
 	memset(buf, 0, BUF_SIZE);
-	const char *msg = "Hello World!";
+
+	make_crc16_table();
 
 	//connect to the server
 	addr_in.sin_family = AF_INET;
@@ -70,11 +72,45 @@ int main(int argc, char const *argv[]) {
 
 	printf("connected successfully\n");
 
-	//build the message
-	n_to_write = 2 + strlen(msg);
-	buf[0] = (unsigned char)n_to_write;
-	buf[1] = (unsigned char)(n_to_write >> 8);
-	strncpy((char *)(buf + 2), msg, BUF_SIZE - 2 - 1);
+	/*
+	 * Build the request Auth packet
+	 *
+	 * 0A00 8781 C8FD190568EA 00 01 7310
+	 *
+	 */
+	buf[0] = 0x0A;	//len
+	buf[1] = 0x00;
+
+	buf[2] = 0x00;	//crc
+	buf[3] = 0x00;
+
+	buf[4] = 0xCB;	//mac address
+	buf[5] = 0xFD;
+	buf[6] = 0x19;
+	buf[7] = 0x05;
+	buf[8] = 0x68;
+	buf[9] = 0xEA;
+
+	buf[10] = 0x00;	//sequence
+
+	buf[11] = 0x01;	//type - Auth
+
+	buf[12] = 0x73;	//version 4211
+	buf[13] = 0x10;
+
+
+	uint16_t crc = get_crc16(buf + 4, 10);
+
+	buf[2] = (uint8_t)crc;	//crc
+	buf[3] = (uint8_t)(crc >> 8);
+
+	n_to_write = 14;
+
+#ifdef DEBUG
+	printf("---> ");
+	for(int i = 0; i < n_to_write; i++) printf("%02X ", buf[i]);
+	printf("\n");
+#endif
 
 	timeout = time(NULL) + CONN_TIMEOUT;
 
@@ -121,8 +157,8 @@ int main(int argc, char const *argv[]) {
 				n_avail += n;
 
 				if (req_len == 0 && n > 2) {
-					len = (int)((uint16_t)buf[1] >> 8) + (uint16_t)buf[0];
-					if (len == 0 || len > BUF_SIZE) {
+					len = (int)(((uint16_t)buf[1] << 8) + (uint16_t)buf[0]) + 4/*sizeof(header1)*/;
+					if (len < PACKET_HEADER_SIZE || len > BUF_SIZE) {
 						printf("invalid request len (%d)\n", len);
 						break;
 					}
@@ -130,12 +166,10 @@ int main(int argc, char const *argv[]) {
 				}
 
 				if (n_avail == req_len) {
-					printf("%s\n", buf + 2);
-					if (++count > N) continue;
-
-					n_to_write = n_avail;	//echo
-					state = ST_WRITE;
-
+#ifdef DEBUG
+					for(int i = 0; i < n_avail; i++) printf("%02X ", buf[i]);
+					printf(" <---\n");
+#endif
 					n_avail = req_len = 0;
 					timeout = time(NULL) + CONN_TIMEOUT;
 				}

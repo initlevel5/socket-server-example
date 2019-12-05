@@ -21,13 +21,15 @@
 #define ADDR "127.0.0.1"
 #define PORT (8082)
 
-#define BUF_SIZE (1024)
+#define BUF_SIZE (1412)
 #define INVALID_SOCKET (-1)
 #define QLEN (65536)
 
 #define CONN_TIMEOUT (10)
 
 #define MAX_NUM_THREADS (10)
+
+#define VERSION (4211)
 
 #define FD_CLOSE(x) do {\
 	while (close((x)) == -1 && errno == EINTR);\
@@ -428,8 +430,8 @@ static void conn_read(int *fd, struct conn *pc) {
 	pc->n_avail += n;
 
 	if (pc->req_len == 0 && n > 2) {
-		len = (int)((uint16_t)pc->buf[1] >> 8) + (uint16_t)pc->buf[0];
-		if (len < 3 || len > BUF_SIZE) {
+		len = (int)(((uint16_t)pc->buf[1] << 8) + (uint16_t)pc->buf[0]) + 4/*sizeof(header1)*/;
+		if (len < PACKET_HEADER_SIZE || len > BUF_SIZE) {
 			printf("conn_read(): invalid request len (%d)\n", len);
 			conn_close(fd, pc);
 			return;
@@ -442,6 +444,14 @@ static void conn_read(int *fd, struct conn *pc) {
 			conn_close(fd, pc);
 			return;
 		}
+
+#ifdef DEBUG
+		printf("---> ");
+		for(int i = 0; i < pc->n_to_write; i++) printf("%02X ", pc->buf[i]);
+		printf("\n");
+#endif
+
+		pc->state = ST_WRITE;
 
 		pc->n_avail = pc->req_len = 0;
 		pc->timeout = time(NULL) + CONN_TIMEOUT;
@@ -480,10 +490,63 @@ static void conn_write(int *fd, struct conn *pc) {
  * If successful, the function will return 0 or -1 if an error occurred.
  */
 static int conn_proto_handler(struct conn *pc) {
-	printf("%s\n", pc->buf + 2);
+	struct packet *p = (struct packet *)pc->buf;
+	uint16_t crc = get_crc16(pc->buf + 4, p->len);
+	uint16_t ver = ((uint16_t)p->data[1] << 8) + (uint16_t)p->data[0];
+	
+#ifdef DEBUG
+	for(int i = 0; i < p->len + 4; i++) printf("%02X ", pc->buf[i]);
+	printf(" <---\n");
+	printf("len%d\ncrc%d\nseq%d\ntype%d\nver%d\n", p->len, p->crc, p->seq, p->type, ver);
+#endif
 
-	pc->n_to_write = pc->n_avail;	//echo
-	pc->state = ST_WRITE;
+	if (p->crc != crc) {
+		printf("conn_proto_handler(): invalid crc (%d, expected %d)\n", p->crc, crc);
+		return -1;
+	}
+
+	if (ver != VERSION) {
+		printf("conn_proto_handler(): invalid version (%d, expected %d)\n", ver, VERSION);
+		return -1;
+	}
+
+	switch (p->type) {
+		case PTYPE_AUTH: {
+			/*
+			 * Build the response Auth packet
+			 *
+			 * 0C00 8B55 C8FD190568EA 00 01 0B99DE5D
+			 */
+			time_t now = time(NULL);
+
+			p->len = 12;
+
+			p->data[0] = (uint8_t)now;
+			p->data[1] = (uint8_t)(now >> 8);
+			p->data[2] = (uint8_t)(now >> 16);
+			p->data[3] = (uint8_t)(now >> 24);
+
+			p->crc = get_crc16(pc->buf + 4, p->len);
+		}
+		break;
+		case PTYPE_PING: 
+		case PTYPE_SENSOR_DATA:
+		case PTYPE_FILE:
+		case PTYPE_LOG:
+		case PTYPE_NODE_PACKET:
+		case PTYPE_BRIDGE_PACKET:
+		case PTYPE_REAUTH:
+		case PTYPE_CAM:
+		case PTYPE_NODE_FILE:
+		case PTYPE_VEND_FILE:
+		case PTYPE_REGISTER_BRIDGE:
+		case PTYPE_PURCHASE:
+		case PTYPE_COUNT:
+		break;
+		default: printf("conn_proto_handler(): invalid type (%d)\n", p->type); return -1;
+	}
+
+	pc->n_to_write = p->len + 4/*sizeof(header1)*/;
 
 	return 0;
 }

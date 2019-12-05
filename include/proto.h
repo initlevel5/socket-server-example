@@ -7,6 +7,7 @@
 #include <inttypes.h>
 
 #define PACKET_MAC_SIZE (6)
+#define PACKET_HEADER_SIZE (12)
 #define PACKET_DATA_SIZE (1400)
 
 enum packet_type {
