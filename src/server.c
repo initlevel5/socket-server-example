@@ -33,8 +33,18 @@
 } while (0)
 
 enum conn_state {
-	ST_READ,
-	ST_WRITE,
+	ST_READ = 0,
+	ST_WRITE = 1,
+};
+
+struct conn {
+	enum conn_state state;
+	unsigned char buf[BUF_SIZE];
+	int n_avail;
+	int req_len;
+	int n_to_write;
+	int n_written;
+	time_t timeout;
 };
 
 //@TODO implement real thread pool
@@ -43,40 +53,38 @@ struct thread {
 	int fd;
 };
 
-//@TODO implement list of connections
-/* strict conn {
-	int fd;
-	enum conn_state state;
-
-	...
-}*/
-
 static volatile sig_atomic_t g_shutdown = 0;
 static struct thread *th = NULL;
 static pthread_mutex_t th_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int server_init(void);
+static int init(void);
+static void clean(void);
+static void serve(int listener);
+
 static void sig_term_handler(int sig);
 static void conf_sig_term_handler(void);
-static int server_listen(const char *addr, uint16_t port);
+
+static int get_listener(const char *addr, uint16_t port);
 static int make_socket_nonblocking(int fd);
-static void server_clean(void);
-static void serve(int listener);
-static inline int server_accept(int listener);
-static void *th_proc(void *arg);
+
+static inline int conn_accept(int listener);
+static void *conn_proc(void *arg);
+static void conn_close(int *fd, struct conn *pc);
+static void conn_read(int *fd, struct conn *pc);
+static void conn_write(int *fd, struct conn *pc);
 
 int main(int argc, char const *argv[]) {
 	int listener;
 	
-	if (server_init() != 0) _exit(EXIT_FAILURE);
+	if (init() != 0) _exit(EXIT_FAILURE);
 
-	if ((listener = server_listen(ADDR, PORT)) == INVALID_SOCKET) _exit(EXIT_FAILURE);
+	if ((listener = get_listener(ADDR, PORT)) == INVALID_SOCKET) _exit(EXIT_FAILURE);
 
 	serve(listener);
 
 	FD_CLOSE(listener);
 
-	server_clean();
+	clean();
 
 	(void)argc;
 	(void)argv;
@@ -89,7 +97,7 @@ int main(int argc, char const *argv[]) {
  *
  * If successful, the function will return 0 or -1 if an error occurred.
  */
-static int server_init(void) {
+static int init(void) {
 	int err;
 
 	conf_sig_term_handler();
@@ -133,7 +141,7 @@ static void conf_sig_term_handler(void) {
  *
  * Returns the socket that has been created or -1 if an error occurred.
  */
-static int server_listen(const char *addr, uint16_t port) {
+static int get_listener(const char *addr, uint16_t port) {
 	int fd, flag = 1, err = 0;
 	struct sockaddr_in addr_in;
 	socklen_t addrlen = sizeof(struct sockaddr_in);
@@ -205,7 +213,7 @@ static int make_socket_nonblocking(int fd) {
  * Suspends execution until the all threads terminate, unless the threads have already terminated.
  * Frees the resources allocated for thread pool and mutex.
  */
-static void server_clean(void) {
+static void clean(void) {
 	for (int i = 0; i < MAX_NUM_THREADS; i++) pthread_join(th[i].id, NULL);
 	free(th);
 	pthread_mutex_destroy(&th_mutex);
@@ -240,7 +248,7 @@ static void serve(int listener) {
 				g_shutdown = 1;
 			}
 		} else if (res > 0) {
-			if (FD_ISSET(listener, &rfds) && server_accept(listener) != 0) g_shutdown = 1;
+			if (FD_ISSET(listener, &rfds) && conn_accept(listener) != 0) g_shutdown = 1;
 		}
 	}
 }
@@ -255,7 +263,7 @@ static void serve(int listener) {
  *
  * If successful, the function will return 0 or -1 if an error occurred.
  */
-static inline int server_accept(int listener) {
+static inline int conn_accept(int listener) {
 	int fd, err = 0, i;
 	struct sockaddr_in addr;
 	socklen_t addrlen = sizeof(struct sockaddr_in);
@@ -287,7 +295,7 @@ static inline int server_accept(int listener) {
 		if (th[i].fd == INVALID_SOCKET) {
 			th[i].fd = fd;
 			if (th[i].id == 0) {
-				if (pthread_create(&th[i].id, NULL, th_proc, (void *)&th[i].fd) != 0) {
+				if (pthread_create(&th[i].id, NULL, conn_proc, (void *)&th[i].fd) != 0) {
 					err = errno;
 					printf("conn_accept(): pthread_create(): %s (%d)\n", strerror(err), err);
 					FD_CLOSE(th[i].fd);
@@ -313,148 +321,144 @@ static inline int server_accept(int listener) {
  *
  * Returns NULL.
  */
-static void *th_proc(void *arg) {
+static void *conn_proc(void *arg) {
 	int *fd = (int *)arg;
-	int err = 0, len, n, n_avail = 0, req_len = 0, n_to_write = 0, n_written = 0, res;
-	enum conn_state state = ST_READ;
+	struct conn *pc = NULL;
+	int err = 0, res;
 	struct sockaddr_in addr_in;
 	socklen_t addrlen = sizeof(struct sockaddr_in);
 	memset(&addr_in, 0, addrlen);
 	fd_set rfds, wfds;
 	struct timeval tv = {0, 0};
-	time_t timeout;
-	unsigned char buf[BUF_SIZE];
-	memset(buf, 0, BUF_SIZE);
 
-	timeout = time(NULL) + CONN_TIMEOUT;
+	if ((pc = (struct conn *)calloc(1, sizeof(*pc))) == NULL) {
+		printf("conn_proc(): can't allocate memory\n");
+		return NULL;
+	}
 
 	while (!g_shutdown) {
 		FD_ZERO(&rfds);
 		FD_ZERO(&wfds);
 
 		if (*fd != INVALID_SOCKET) {
-			if (state == ST_READ) {
+			if (pc->state == ST_READ) {
 				FD_SET(*fd, &rfds);
-			} else if (state == ST_WRITE) {
+			} else if (pc->state == ST_WRITE) {
 				FD_SET(*fd, &wfds);
 			}
 		}
 
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
+		tv.tv_sec = 0;
+		tv.tv_usec = 100000; //100ms
 
 		if ((res = select(*fd + 1, &rfds, &wfds, NULL, &tv)) == -1) {
 			err = errno;
 			if (err != EINTR) {
-				printf("th_proc(): select(): %s (%d)\n", strerror(err), err);
+				printf("conn_proc(): select(): %s (%d)\n", strerror(err), err);
 				break;
 			}
 		} else if (res == 0) {
-			if (*fd != INVALID_SOCKET && state == ST_READ && timeout < time(NULL)) {
-				printf("th_proc(): connection timeout\n");
-				if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
-					printf("th_proc(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
-					break;
-				}
-				FD_CLOSE(*fd);
-				pthread_mutex_unlock(&th_mutex);
-				n_avail = req_len = 0;
+			if (*fd != INVALID_SOCKET && pc->timeout < time(NULL)) {
+				printf("conn_proc(): connection timeout\n");
+				conn_close(fd, pc);
 			}
 		} else {
 			if (FD_ISSET(*fd, &rfds)) {
-				n = recv(*fd, buf + n_avail, BUF_SIZE - n_avail, 0);
-
-				if (n < 1) {
-					if (n == -1) {
-						err = errno;
-						if (err != EINTR) {
-							printf("recv(): %s (%d)\n", strerror(err), err);
-							break;
-						}
-					} else {
-						printf("recv(): connection closed by peer\n");
-						if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
-							printf("recv(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
-							break;
-						}
-						FD_CLOSE(*fd);
-						pthread_mutex_unlock(&th_mutex);
-					}
-					continue;
-				}
-
-				n_avail += n;
-
-				if (req_len == 0 && n > 2) {
-					len = (int)((uint16_t)buf[1] >> 8) + (uint16_t)buf[0];
-					if (len < 3 || len > BUF_SIZE) {
-						printf("recv(): invalid request len (%d)\n", len);
-						if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
-							printf("recv(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
-							break;
-						}
-						FD_CLOSE(*fd);
-						pthread_mutex_unlock(&th_mutex);
-						continue;
-					}
-					req_len = len;
-				}
-
-				if (n_avail == req_len) {
-					printf("%s\n", buf + 2);
-
-					n_to_write = n_avail;	//echo
-					state = ST_WRITE;
-
-					n_avail = req_len = 0;
-					timeout = time(NULL) + CONN_TIMEOUT;
-				}
-
+				conn_read(fd, pc);
 			} else if (FD_ISSET(*fd, &wfds)) {
-				n = send(*fd, buf + n_written, n_to_write - n_written, 0);
-
-				if (n < 1) {
-					if (n == -1) {
-						err = errno;
-						if (err != EINTR) {
-							printf("send(): %s (%d)\n", strerror(err), err);
-							break;
-						}
-					} else {
-						printf("send(): connection closed by peer\n");
-						if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
-							printf("send(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
-							break;
-						}
-						FD_CLOSE(*fd);
-						pthread_mutex_unlock(&th_mutex);
-					}
-					continue;
-				}
-
-				n_written += n;
-
-				if (n_written == n_to_write) {
-					n_to_write = n_written = 0;
-					state = ST_READ;
-				}
+				conn_write(fd, pc);
 			}
 		}
 	}
 
-	pthread_mutex_lock(&th_mutex);
-	FD_CLOSE(*fd);
-	pthread_mutex_unlock(&th_mutex);
+	conn_close(fd, pc);
 
 	return NULL;
 }
 
 /*
-static int server_read(struct conn *pc) {
+ * Closes the given socket descriptor 'fd' and
+ * cleans connection data.
+ */
+static void conn_close(int *fd, struct conn *pc) {
+	int err;
 
+	memset(pc->buf, 0, BUF_SIZE);
+
+	pc->n_avail = pc->req_len = pc->n_to_write = pc->n_written = 0;
+	pc->state = ST_READ;
+
+	if ((err = pthread_mutex_lock(&th_mutex)) != 0) {
+		printf("conn_close(): pthread_mutex_lock(): %s (%d)\n", strerror(err), err);
+		return;
+	}
+	FD_CLOSE(*fd);
+	pthread_mutex_unlock(&th_mutex);
 }
 
-static int server_write(struct conn *pc) {
+/*
+ * Receives messages from the given socket 'fd'.
+ */
+static void conn_read(int *fd, struct conn *pc) {
+	int err, len, n;
 
+	if ((n = recv(*fd, pc->buf + pc->n_avail, BUF_SIZE - pc->n_avail, 0)) < 1) {
+		if (n == -1) {
+			err = errno;
+			if (err == EINTR || err == EAGAIN) return;
+			printf("conn_read(): recv(): %s (%d)\n", strerror(err), err);
+		} else {
+			printf("conn_read(): recv(): connection closed by peer\n");
+		}
+		conn_close(fd, pc);
+		return;
+	}
+
+	pc->n_avail += n;
+
+	if (pc->req_len == 0 && n > 2) {
+		len = (int)((uint16_t)pc->buf[1] >> 8) + (uint16_t)pc->buf[0];
+		if (len < 3 || len > BUF_SIZE) {
+			printf("conn_read(): invalid request len (%d)\n", len);
+			conn_close(fd, pc);
+			return;
+		}
+		pc->req_len = len;
+	}
+
+	if (pc->n_avail == pc->req_len) {
+		printf("%s\n", pc->buf + 2);
+
+		pc->n_to_write = pc->n_avail;	//echo
+		pc->state = ST_WRITE;
+
+		pc->n_avail = pc->req_len = 0;
+		pc->timeout = time(NULL) + CONN_TIMEOUT;
+	}
 }
-*/
+
+/*
+ * Sends messages to the given socket 'fd'.
+ */
+static void conn_write(int *fd, struct conn *pc) {
+	int err, n;
+
+	if ((n = send(*fd, pc->buf + pc->n_written, pc->n_to_write - pc->n_written, 0)) < 1) {
+		if (n == -1) {
+			err = errno;
+			if (err == EINTR || err == EAGAIN) return;
+			printf("conn_write(): send(): %s (%d)\n", strerror(err), err);
+		} else {
+			printf("conn_write(): send(): connection closed by peer\n");
+		}
+		conn_close(fd, pc);
+		return;
+	}
+
+	pc->n_written += n;
+
+	if (pc->n_written == pc->n_to_write) {
+		pc->n_to_write = pc->n_written = 0;
+		pc->state = ST_READ;
+	}
+}
