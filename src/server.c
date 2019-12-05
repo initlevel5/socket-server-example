@@ -16,6 +16,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "proto.h"
+
 #define ADDR "127.0.0.1"
 #define PORT (8082)
 
@@ -104,6 +106,8 @@ static int init(void) {
 	int err;
 
 	conf_sig_term_handler();
+
+	make_crc16_table();
 
 	//@TODO implement real thread pool instead
 	if ((err = pthread_mutex_init(&th_mutex, NULL)) != 0) {

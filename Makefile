@@ -13,7 +13,7 @@ LDFLAGS := -lm -lpthread
 all: server client 
 
 server:
-	$(CC) $(SDIR)/server.c $(CFLAGS) -o $@ $(LDFLAGS)
+	$(CC) $(SDIR)/server.c $(SDIR)/proto.c $(CFLAGS) -o $@ $(LDFLAGS)
 
 client:
 	$(CC) $(SDIR)/client.c $(CFLAGS) -o $@ $(LDFLAGS)
